@@ -4,26 +4,22 @@ import functools
 
 import pandas as pd
 
-from river import anomaly, utils
-from river.neighbors.base import DistanceFunc
+from river import anomaly, utils, base
+from river.neighbors import SWINN
+from river.neighbors.base import BaseNN, FunctionWrapper, DistanceFunc
 from river.utils import VectorDict
-
 
 class ILOF(anomaly.base.AnomalyDetector):
     """Incremental Local Outlier Factor (ILOF).
-
     ILOF Algorithm as described in the reference paper
     ----------
-
     The Incremental Local Outlier Factor (ILOF) is an online version of the Local Outlier Factor (LOF) used to identify outliers based on density of local neighbors.
-
     We consider:
         - NewPoints: new points;
         - kNN(p): the neighboors of p (the k closest points to p)
         - RkNN(p): the rev-neighboors of p (points that have p as one of their neighboors)
         - Set_upd_lrd: Set of points that need to update the local reachability distance
         - Set_upd_lof: Set of points that need to update the local outlier factor
-
     The algorithm here implemented based on the original one in the paper is:
         1) Insert NewPoints and calculate its distance to existing points
         2) Update the neighboors and reverse-neighboors of all the points
@@ -32,7 +28,7 @@ class ILOF(anomaly.base.AnomalyDetector):
         5) Update the reachability-distance for affected points: RkNN(RkNN(NewPoints)) -> RkNN(NewPoints)
         6) Update local reachability distance of affected points: lrd(Set_upd_lrd)
         7) Update local outlier factor: lof(Set_upd_lof)
-
+        
     Parameters
     ----------
     n_neighbors : int
@@ -43,7 +39,6 @@ class ILOF(anomaly.base.AnomalyDetector):
         A distance function to use. By default, the Euclidean distance is used.
     verbose: boolean
         Whether or not to print messages
-
     Attributes
     ----------
     X
@@ -68,7 +63,6 @@ class ILOF(anomaly.base.AnomalyDetector):
         A dictionary to hold local reachability distances for each observation.
     skip_first
         A boolean value indicating whether to skip the first window of data.
-
     Example
     ----------
     from river import datasets
@@ -84,7 +78,6 @@ class ILOF(anomaly.base.AnomalyDetector):
     lof_score = []
     for x in dataset[0][100:120]:
         lof_score.append(ilof_river.score_one(x))
-
     References
     ----------
     Pokrajac, David & Lazarevic, Aleksandar & Latecki, Longin Jan. (2007). Incremental Local Outlier Detection for Data Streams. Proceedings of the 2007 IEEE Symposium on Computational Intelligence and Data Mining, CIDM 2007. 504-515. 10.1109/CIDM.2007.368917.
@@ -93,11 +86,22 @@ class ILOF(anomaly.base.AnomalyDetector):
     def __init__(
         self,
         n_neighbors: int = 10,
-        verbose=True,
+        verbose = True,
         distance_func: DistanceFunc = None,
-    ):
+        engine = None,
+        maxlen = 1000000,
+        warm_up = 400):
+        
+        if distance_func is None:
+            distance_func = functools.partial(utils.math.minkowski_distance, p=2)
+        self.distance_func = distance_func
+        if engine is None:
+            engine = SWINN(dist_func=self.distance_func, maxlen=maxlen)
+        if not isinstance(engine.dist_func, FunctionWrapper):
+            engine.dist_func = FunctionWrapper(engine.dist_func)
+        self.warm_up = warm_up
+        self.engine = engine
         self.n_neighbors = n_neighbors
-        self.X: list = []
         self.X_batch: list = []
         self.X_score: list = []
         self.dist_dict: dict = {}
@@ -108,16 +112,12 @@ class ILOF(anomaly.base.AnomalyDetector):
         self.lof: dict = {}
         self.local_reach: dict = {}
         self.verbose = verbose
-        self.distance = (
-            distance_func
-            if distance_func is not None
-            else functools.partial(utils.math.minkowski_distance, p=2)
-        )
+        self._nn: BaseNN = self.engine.clone(include_attributes=True)
+        self.count = 0
 
     def learn_many(self, X_batch: pd.Series):
         """
         Update the model with many incoming observations
-
         Parameters
         ----------
         X_batch
@@ -129,30 +129,31 @@ class ILOF(anomaly.base.AnomalyDetector):
     def learn_one(self, x: dict):
         """
         Update the model with one incoming observation
-
         Parameters
         ----------
         x
             A dictionary of feature values.
         """
         self.X_batch.append(x)
-        if len(self.X) or len(self.X_batch) > 1:
+        if len(self._nn) or len(self.X_batch) > 1:
             self.learn(self.X_batch)
             self.X_batch = []
 
     def learn(self, X_batch: list):
-        X_batch, equal = self.check_equal(X_batch, self.X)
+        # Check for equal samples
+        X_batch, equal = self.check_equal(X_batch, self._nn)
+        
         if equal != 0 and self.verbose:
             print("%i samples are equal to previous data" % equal)
-
+            
         if len(X_batch) == 0:
             if self.verbose:
                 print("No new data was added")
         else:
             # Increase size of objects to acomodate new data
-            (
-                nm,
-                self.X,
+            (   n_x,
+                n_new,
+                self._nn,
                 self.neighborhoods,
                 self.rev_neighborhoods,
                 self.k_dist,
@@ -162,57 +163,32 @@ class ILOF(anomaly.base.AnomalyDetector):
                 self.lof,
             ) = self.expand_objects(
                 X_batch,
-                self.X,
+                self._nn,
                 self.neighborhoods,
                 self.rev_neighborhoods,
                 self.k_dist,
                 self.reach_dist,
                 self.dist_dict,
                 self.local_reach,
-                self.lof,
-            )
+                self.lof)
 
             # Calculate neighborhoods, reverse neighborhoods, k-distances and distances between neighboors
-            (
-                self.neighborhoods,
-                self.rev_neighborhoods,
-                self.k_dist,
-                self.dist_dict,
-            ) = self.initial_calculations(
-                self.X, nm, self.neighborhoods, self.rev_neighborhoods, self.k_dist, self.dist_dict
-            )
+            (   self.neighborhoods, self.rev_neighborhoods, self.k_dist, self.dist_dict) = self.initial_calculations(
+                self._nn, n_x, n_new, self.neighborhoods, self.rev_neighborhoods, self.k_dist, self.dist_dict )
 
             # Define sets of particles
-            (
-                Set_new_points,
-                Set_neighbors,
-                Set_rev_neighbors,
-                Set_upd_lrd,
-                Set_upd_lof,
-            ) = self.define_sets(nm, self.neighborhoods, self.rev_neighborhoods)
+            (   Set_new_points, Set_rev_neighbors, Set_upd_lrd, Set_upd_lof,
+            ) = self.define_sets(n_x, n_new, self.neighborhoods, self.rev_neighborhoods)
 
             # Calculate new reachability distance of all affected points
             self.reach_dist = self.calc_reach_dist_newpoints(
-                Set_new_points,
-                self.neighborhoods,
-                self.rev_neighborhoods,
-                self.reach_dist,
-                self.dist_dict,
-                self.k_dist,
-            )
+                Set_new_points, self.neighborhoods, self.rev_neighborhoods, self.reach_dist, self.dist_dict, self.k_dist )
             self.reach_dist = self.calc_reach_dist_otherpoints(
-                Set_rev_neighbors,
-                self.neighborhoods,
-                self.rev_neighborhoods,
-                self.reach_dist,
-                self.dist_dict,
-                self.k_dist,
-            )
+                Set_rev_neighbors, self.neighborhoods, self.rev_neighborhoods, self.reach_dist, self.dist_dict, self.k_dist )
 
             # Calculate new local reachability distance of all affected points
             self.local_reach = self.calc_local_reach_dist(
-                Set_upd_lrd, self.neighborhoods, self.reach_dist, self.local_reach
-            )
+                Set_upd_lrd, self.neighborhoods, self.reach_dist, self.local_reach )
 
             # Calculate new Local Outlier Factor of all affected points
             self.lof = self.calc_lof(Set_upd_lof, self.neighborhoods, self.local_reach, self.lof)
@@ -222,35 +198,32 @@ class ILOF(anomaly.base.AnomalyDetector):
         Score incoming observations based on model constructed previously.
         Perform same calculations as 'learn_one' function but doesn't add the new calculations to the atributes
         Data samples that are equal to samples stored by the model are not considered.
-
         Parameters
         ----------
         x
             A dictionary of feature values.
         window_score
             The size of the batch of data to be taken in at once for the model to score
-
         Returns
         -------
         lof : list
             List of LOF calculated for incoming data
         """
-
         self.X_score.append(x)
 
         if len(self.X_score) >= window_score:
-            self.X_score, equal = self.check_equal(self.X_score, self.X)
-            if equal != 0 and self.verbose:
-                print("%i samples are equal to previous data" % equal)
+            # Check for equal samples
+            self.X_score, equal = self.check_equal(self.X_score, self._nn)
+            
+            if equal != 0 and self.verbose: print("%i samples are equal to previous data" % equal)
 
             if len(self.X_score) == 0:
-                if self.verbose:
-                    print("No new data was added")
-            else:
-                Xs = self.X.copy()
-                (
-                    nm,
-                    Xs,
+                if self.verbose: print("No new data was added")
+            else:                
+                # Increase size of objects to acomodate new data
+                (   n_x,
+                    n_new,
+                    nn,
                     neighborhoods,
                     rev_neighborhoods,
                     k_dist,
@@ -260,59 +233,52 @@ class ILOF(anomaly.base.AnomalyDetector):
                     lof,
                 ) = self.expand_objects(
                     self.X_score,
-                    Xs,
+                    self._nn,
                     self.neighborhoods,
                     self.rev_neighborhoods,
                     self.k_dist,
                     self.reach_dist,
                     self.dist_dict,
                     self.local_reach,
-                    self.lof,
-                )
+                    self.lof)
 
+                # Calculate neighborhoods, reverse neighborhoods, k-distances and distances between neighboors
                 neighborhoods, rev_neighborhoods, k_dist, dist_dict = self.initial_calculations(
-                    Xs, nm, neighborhoods, rev_neighborhoods, k_dist, dist_dict
-                )
-                (
-                    Set_new_points,
-                    Set_neighbors,
-                    Set_rev_neighbors,
-                    Set_upd_lrd,
-                    Set_upd_lof,
-                ) = self.define_sets(nm, neighborhoods, rev_neighborhoods)
+                    nn, n_x, n_new, neighborhoods, rev_neighborhoods, k_dist, dist_dict)
+                
+                # Define sets of particles
+                (   Set_new_points, Set_rev_neighbors, Set_upd_lrd, Set_upd_lof
+                ) = self.define_sets(n_x, n_new, neighborhoods, rev_neighborhoods)
+                
+                # Calculate new reachability distance of all affected points
                 reach_dist = self.calc_reach_dist_newpoints(
-                    Set_new_points, neighborhoods, rev_neighborhoods, reach_dist, dist_dict, k_dist
-                )
+                    Set_new_points, neighborhoods, rev_neighborhoods, reach_dist, dist_dict, k_dist)
                 reach_dist = self.calc_reach_dist_otherpoints(
-                    Set_rev_neighbors,
-                    neighborhoods,
-                    rev_neighborhoods,
-                    reach_dist,
-                    dist_dict,
-                    k_dist,
-                )
+                    Set_rev_neighbors, neighborhoods, rev_neighborhoods, reach_dist, dist_dict, k_dist)
+                
+                # Calculate new local reachability distance of all affected points
                 local_reach = self.calc_local_reach_dist(
-                    Set_upd_lrd, neighborhoods, reach_dist, local_reach
-                )
+                    Set_upd_lrd, neighborhoods, reach_dist, local_reach)
+                
+                # Calculate new Local Outlier Factor of all affected points
                 lof = self.calc_lof(Set_upd_lof, neighborhoods, local_reach, lof)
                 self.X_score = []
 
-                score_keys = list(range(nm[0], nm[0] + nm[1]))
+                score_keys = list(range(n_x, n_x + n_new))
                 return [lof[i] for i in score_keys]
 
     def initial_calculations(
         self,
-        X: list,
-        nm: tuple,
+        nn: list,
+        n_x: tuple,
+        n_new: tuple,
         neighborhoods: dict,
         rev_neighborhoods: dict,
         k_distances: dict,
-        dist_dict: dict,
-    ):
+        dist_dict: dict):
         """
         Perform initial calculations on the incoming data before applying the ILOF algorithm.
         Taking the new data, it updates the neighborhoods, reverse neighborhoods, k-distances and distances between particles.
-
         Parameters
         ----------
         X
@@ -327,7 +293,6 @@ class ILOF(anomaly.base.AnomalyDetector):
             A dictionary to hold k-distances for each observation.
         dist_dict : dict of dicts
             A dictionary of dictionaries storing distances between particles
-
         Returns
         -------
         neighborhoods : dict
@@ -339,15 +304,11 @@ class ILOF(anomaly.base.AnomalyDetector):
         dist_dict : dict of dicts
             Updated dictionary of dictionaries storing distances between particles
         """
-
-        n = nm[0]
-        m = nm[1]
         k = self.n_neighbors
 
         # Calculate distances all particles consdering new and old ones
-        new_distances = [
-            [i, j, self.distance(X[i], X[j])] for i in range(n + m) for j in range(i) if i >= n
-        ]
+        new_distances = self.calculate_dist(n_x, n_new, nn)
+        
         # Add new distances to distance dictionary
         for i in range(len(new_distances)):
             dist_dict[new_distances[i][0]][new_distances[i][1]] = new_distances[i][2]
@@ -358,10 +319,8 @@ class ILOF(anomaly.base.AnomalyDetector):
             k_distances[i] = sorted(inner_dict.values())[min(k, len(inner_dict.values())) - 1]
 
         # Only keep particles that are neighbors in distance dictionary
-        dist_dict = {
-            k: {k2: v2 for k2, v2 in v.items() if v2 <= k_distances[k]}
-            for k, v in dist_dict.items()
-        }
+        dist_dict = { k: {k2: v2 for k2, v2 in v.items() if v2 <= k_distances[k]}
+                    for k, v in dist_dict.items() }
 
         # Define new neighborhoods for particles
         for key, value in dist_dict.items():
@@ -374,56 +333,68 @@ class ILOF(anomaly.base.AnomalyDetector):
 
         return neighborhoods, rev_neighborhoods, k_distances, dist_dict
 
+    def calculate_dist(self, n_x, n_new, X):
+        #relação entre novos e existentes calcular por força bruta, entre novos e novos pelo swimm
+        if len(X) < self.warm_up:
+            new_distances = [[i, j, self.distance_func(X[i].item[0], X[j].item[0])] 
+                for i in range(n_x + n_new) for j in range(i) if i >= n_x ]
+        else: 
+            new_distances=[]
+            for i in range(n_x, n_x+n_new):
+                k,v = X.search(X[i].item, n_neighbors=self.n_neighbors)
+                new_distances += [[X[i].item[1],p[1],d] for p,d in zip(k,v) if X[i].item[1]!=p[1]]
+        return new_distances
+
     def check_equal(self, X: list, Y: list):
         """Check if new batch X has some data samples equal to previous data recorded Y"""
-        result = [x for x in X if not any(x == y for y in Y)]
+        result = [x for x in X if not any(x == y.item[0] for y in Y)]
         return result, len(X) - len(result)
 
     def expand_objects(
         self,
         new_particles: list,
-        X: list,
+        nn,
         neighborhoods: dict,
         rev_neighborhoods: dict,
         k_dist: dict,
         reach_dist: dict,
         dist_dict: dict,
         local_reach: dict,
-        lof: dict,
-    ):
+        lof: dict ):
+        
         """Expand size of dictionaries and lists to fit new data"""
-        n = len(X)
-        m = len(new_particles)
-        X.extend(new_particles)
-        neighborhoods.update({i: [] for i in range(n + m)})
-        rev_neighborhoods.update({i: [] for i in range(n + m)})
-        k_dist.update({i: float("inf") for i in range(n + m)})
-        reach_dist.update({i + n: {} for i in range(m)})
-        dist_dict.update({i + n: {} for i in range(m)})
-        local_reach.update({i + n: [] for i in range(m)})
-        lof.update({i + n: [] for i in range(m)})
+        n_x = len(nn._data)
+        n_new = len(new_particles)
+        for new_particle in new_particles:
+            nn.append((new_particle, self.count))
+            self.count+=1
+        neighborhoods.update({i: [] for i in range(n_x + n_new)})
+        rev_neighborhoods.update({i: [] for i in range(n_x + n_new)})
+        k_dist.update({i: float("inf") for i in range(n_x + n_new)})
+        reach_dist.update({i + n_x: {} for i in range(n_new)})
+        dist_dict.update({i + n_x: {} for i in range(n_new)})
+        local_reach.update({i + n_x: [] for i in range(n_new)})
+        lof.update({i + n_x: [] for i in range(n_new)})
         return (
-            (n, m),
-            X,
+            n_x,
+            n_new,
+            nn,
             neighborhoods,
             rev_neighborhoods,
             k_dist,
             reach_dist,
             dist_dict,
             local_reach,
-            lof,
-        )
+            lof )
 
-    def define_sets(self, nm, neighborhoods: dict, rev_neighborhoods: dict):
+    def define_sets(self, n_x, n_new, neighborhoods: dict, rev_neighborhoods: dict):
         """Define sets of points for the ILOF algorithm"""
         # Define set of new points from batch
-        Set_new_points = set(range(nm[0], nm[0] + nm[1]))
-        Set_neighbors: set = set()
+        Set_new_points = set(range(n_x, n_x + n_new))
         Set_rev_neighbors: set = set()
 
-        # Define neighbors and reverse neighbors of new data points
+        # Define reverse neighbors of new data points
         for i in Set_new_points:
-            Set_neighbors = set(Set_neighbors) | set(neighborhoods[i])
             Set_rev_neighbors = set(Set_rev_neighbors) | set(rev_neighborhoods[i])
 
         # Define points that need to update their local reachability distance because of new data points
@@ -437,18 +408,10 @@ class ILOF(anomaly.base.AnomalyDetector):
         for m in Set_upd_lrd:
             Set_upd_lof = Set_upd_lof | set(rev_neighborhoods[m])
         Set_upd_lof = Set_upd_lof
-
-        return Set_new_points, Set_neighbors, Set_rev_neighbors, Set_upd_lrd, Set_upd_lof
+        return Set_new_points, Set_rev_neighbors, Set_upd_lrd, Set_upd_lof
 
     def calc_reach_dist_newpoints(
-        self,
-        Set: set,
-        neighborhoods: dict,
-        rev_neighborhoods: dict,
-        reach_dist: dict,
-        dist_dict: dict,
-        k_dist: dict,
-    ):
+        self, Set: set, neighborhoods: dict, rev_neighborhoods: dict, reach_dist: dict, dist_dict: dict, k_dist: dict):
         """Calculate reachability distance from new points to neighbors and from neighbors to new points"""
         for c in Set:
             for j in set(neighborhoods[c]):
@@ -458,14 +421,7 @@ class ILOF(anomaly.base.AnomalyDetector):
         return reach_dist
 
     def calc_reach_dist_otherpoints(
-        self,
-        Set: set,
-        neighborhoods: dict,
-        rev_neighborhoods: dict,
-        reach_dist: dict,
-        dist_dict: dict,
-        k_dist: dict,
-    ):
+        self, Set: set, neighborhoods: dict, rev_neighborhoods: dict, reach_dist: dict, dist_dict: dict, k_dist: dict):
         """Calculate reachability distance from reverse neighbors of reverse neighbors ( RkNN(RkNN(NewPoints)) ) to reverse neighbors ( RkNN(NewPoints) )
         These values change because of the insertion of new points"""
         for j in Set:
@@ -474,19 +430,17 @@ class ILOF(anomaly.base.AnomalyDetector):
         return reach_dist
 
     def calc_local_reach_dist(
-        self, Set: set, neighborhoods: dict, reach_dist: dict, local_reach_dist: dict
-    ):
+        self, Set: set, neighborhoods: dict, reach_dist: dict, local_reach_dist: dict):
         """Calculate local reachability distance of affected points"""
         for i in Set:
             local_reach_dist[i] = len(neighborhoods[i]) / sum(
-                [reach_dist[i][j] for j in neighborhoods[i]]
-            )
+                [reach_dist[i][j] for j in neighborhoods[i]])
         return local_reach_dist
 
-    def calc_lof(self, Set: set, neighborhoods: dict, local_reach: dict, lof: dict):
+    def calc_lof(
+        self, Set: set, neighborhoods: dict, local_reach: dict, lof: dict):
         """Calculate local outlier factor of affected points"""
         for i in Set:
             lof[i] = sum([local_reach[j] for j in neighborhoods[i]]) / (
-                len(neighborhoods[i]) * local_reach[i]
-            )
+                len(neighborhoods[i]) * local_reach[i])
         return lof

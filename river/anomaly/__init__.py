@@ -25,8 +25,8 @@ __all__ = [
     "AnomalyDetector",
     "GaussianScorer",
     "HalfSpaceTrees",
+    "ILOF",
     "OneClassSVM",
     "QuantileFilter",
     "ThresholdFilter",
-    "ILOF",
 ]
